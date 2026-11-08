@@ -307,18 +307,138 @@
     };
   }
 
+  /* ---------------- Supabase sync shaping (pure / testable) ----------------
+   * The Supabase backend is ONE table, public.hamza_state, with a
+   * single row (id = 1) whose `state` jsonb column holds the whole
+   * normalized shop state — the same whole-state shape the rest of
+   * this file already syncs. These helpers build the exact REST
+   * requests and decide the initial-state resolution; they run in
+   * Node tests with a mock fetch, so the tested code is the shipped
+   * code. No Supabase JS SDK is used — plain fetch only.
+   */
+  var SUPABASE_STATE_ID = 1;
+  var SUPABASE_POLL_MS = 45000;
+  var SUPABASE_SAVE_DEBOUNCE_MS = 800;
+
+  function supabaseConfigReady(cfg) {
+    return !!(cfg && typeof cfg.url === "string" &&
+      cfg.url.indexOf("https://") === 0 &&
+      typeof cfg.anonKey === "string" && cfg.anonKey.length > 20);
+  }
+
+  function supabaseRestBase(cfg) {
+    return String(cfg.url).replace(/\/+$/, "") + "/rest/v1/hamza_state";
+  }
+
+  function supabaseSelectUrl(cfg) {
+    return supabaseRestBase(cfg) + "?id=eq." + SUPABASE_STATE_ID + "&select=state,updated_at";
+  }
+
+  function supabaseHeaders(cfg, extra) {
+    var h = {
+      "apikey": cfg.anonKey,
+      "Authorization": "Bearer " + cfg.anonKey,
+      "Accept": "application/json"
+    };
+    if (extra) { for (var k in extra) { h[k] = extra[k]; } }
+    return h;
+  }
+
+  // The exact upsert request shape used for every cloud save.
+  function supabaseUpsertRequest(cfg, state, updatedAt) {
+    return {
+      url: supabaseRestBase(cfg),
+      method: "POST",
+      headers: supabaseHeaders(cfg, {
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+      }),
+      body: JSON.stringify([{ id: SUPABASE_STATE_ID, state: state, updated_at: updatedAt }])
+    };
+  }
+
+  // REST GET returns an array of rows; [] or a row without an object
+  // state means "no remote state yet".
+  function parseSupabaseRows(json) {
+    if (!Array.isArray(json) || !json.length) { return { state: null, updatedAt: "" }; }
+    var row = json[0] || {};
+    return {
+      state: (row.state && typeof row.state === "object") ? row.state : null,
+      updatedAt: str(row.updated_at)
+    };
+  }
+
+  // "Has data" for a NORMALIZED state: any record at all, or a shop
+  // PIN (a PIN-only device has still been set up and must not be
+  // silently overwritten by an empty remote).
+  function stateHasData(state) {
+    if (!state || typeof state !== "object") { return false; }
+    var keys = ["products", "bills", "customers", "khataEntries", "purchases"];
+    for (var i = 0; i < keys.length; i++) {
+      if (Array.isArray(state[keys[i]]) && state[keys[i]].length > 0) { return true; }
+    }
+    return !!(state.settings && state.settings.pin);
+  }
+
+  // Initial-state resolution on load. Both inputs go through the
+  // SAME normalizeState the app always uses:
+  //   remote has data            -> remote wins
+  //   remote empty, local has data -> local wins and must be pushed
+  //     up (first-device seeding)
+  //   both empty                 -> empty state, nothing to push
+  function resolveInitialState(remoteRaw, localRaw) {
+    var remote = normalizeState(remoteRaw);
+    var local = normalizeState(localRaw);
+    if (stateHasData(remote)) { return { state: remote, source: "remote", shouldPush: false }; }
+    if (stateHasData(local)) { return { state: local, source: "local", shouldPush: true }; }
+    return { state: remote, source: "empty", shouldPush: false };
+  }
+
+  function createSupabaseClient(cfg, fetchImpl) {
+    var doFetch = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
+    function fetchRemote() {
+      if (!doFetch) { return Promise.reject(new Error("fetch is not available")); }
+      return doFetch(supabaseSelectUrl(cfg), {
+        method: "GET",
+        headers: supabaseHeaders(cfg)
+      }).then(function (res) {
+        if (!res || !res.ok) { throw new Error("Supabase GET failed (" + (res ? res.status : "no response") + ")"); }
+        return res.json();
+      }).then(parseSupabaseRows);
+    }
+    function pushState(state, updatedAtIso) {
+      if (!doFetch) { return Promise.reject(new Error("fetch is not available")); }
+      var req = supabaseUpsertRequest(cfg, state, updatedAtIso || new Date().toISOString());
+      return doFetch(req.url, { method: req.method, headers: req.headers, body: req.body })
+        .then(function (res) {
+          if (!res || !res.ok) { throw new Error("Supabase POST failed (" + (res ? res.status : "no response") + ")"); }
+          return true;
+        });
+    }
+    return { fetchRemote: fetchRemote, pushState: pushState };
+  }
+
   /* ---------------- Store adapter (browser only) ----------------
-   * Uses Firebase Realtime Database when window.HAMZA_FIREBASE_CONFIG
-   * has apiKey + databaseURL and the Firebase compat SDK is loaded;
-   * otherwise falls back to localStorage. Whole-state sync (v1):
-   * the full normalized state is written on every save and remote
-   * updates replace local state through onRemote callbacks.
+   * Adapter priority: Supabase (window.HAMZA_SUPABASE_CONFIG) ->
+   * Firebase Realtime Database (window.HAMZA_FIREBASE_CONFIG with
+   * apiKey + databaseURL and the Firebase compat SDK loaded) ->
+   * localStorage. Whole-state sync (v1): the full normalized state
+   * is written on every save and remote updates replace local state
+   * through onRemote callbacks. A failed cloud call never breaks
+   * local use: the store falls back to localStorage and reports an
+   * honest mode ("local" / "supabase-offline") via getMode().
    */
   function createStore() {
-    var mode = "local";
+    var mode = "local"; // local | supabase | supabase-offline | firebase
     var ref = null;
     var lastJson = "";
     var remoteCbs = [];
+    var supa = null;              // Supabase client (createSupabaseClient)
+    var lastSeenUpdatedAt = "";   // updated_at of the last remote row seen/sent
+    var currentState = null;      // last resolved/saved state (for status re-renders)
+    var pendingState = null;      // newest state waiting for the debounced cloud save
+    var saveTimer = null;
+    var pollTimer = null;
 
     function configReady() {
       var c = (typeof window !== "undefined") ? window.HAMZA_FIREBASE_CONFIG : null;
@@ -327,14 +447,14 @@
         window.firebase.database);
     }
 
-    function persist(state) {
-      var json = JSON.stringify(state);
-      lastJson = json;
-      if (mode === "firebase" && ref) {
-        ref.set(state).catch(function () { /* surfaced by caller UI if needed */ });
-      } else if (typeof localStorage !== "undefined") {
-        try { localStorage.setItem(STORAGE_KEY, json); } catch (e) { /* quota */ }
-      }
+    function supabaseConfig() {
+      var c = (typeof window !== "undefined") ? window.HAMZA_SUPABASE_CONFIG : null;
+      return supabaseConfigReady(c) ? c : null;
+    }
+
+    function writeLocal(state) {
+      if (typeof localStorage === "undefined") { return; }
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* quota */ }
     }
 
     function loadLocal() {
@@ -347,7 +467,118 @@
       try { return normalizeState(JSON.parse(raw)); } catch (e) { return emptyState(); }
     }
 
+    // Mode changes re-render the UI (header status) by replaying the
+    // current state through the remote-update callbacks; the state
+    // itself is unchanged, so this is safe.
+    function setMode(next) {
+      if (mode === next) { return; }
+      mode = next;
+      if (currentState) {
+        remoteCbs.forEach(function (cb) { cb(currentState); });
+      }
+    }
+
+    function flushSupabaseSave() {
+      saveTimer = null;
+      if (!supa || !pendingState) { return; }
+      var toSend = pendingState;
+      pendingState = null;
+      var iso = new Date().toISOString();
+      supa.pushState(toSend, iso).then(function () {
+        lastSeenUpdatedAt = iso;
+        setMode("supabase");
+      }).catch(function () {
+        // Keep the newest unsent state so the next mutation or poll
+        // retries it; local use continues from the localStorage copy.
+        if (!pendingState) { pendingState = toSend; }
+        setMode("supabase-offline");
+      });
+    }
+
+    function scheduleSupabaseSave(state) {
+      pendingState = state;
+      if (saveTimer) { clearTimeout(saveTimer); }
+      saveTimer = setTimeout(flushSupabaseSave, SUPABASE_SAVE_DEBOUNCE_MS);
+    }
+
+    function persist(state) {
+      currentState = state;
+      var json = JSON.stringify(state);
+      lastJson = json;
+      if (mode === "supabase" || mode === "supabase-offline") {
+        writeLocal(state); // offline cache / fallback, always immediate
+        scheduleSupabaseSave(state);
+      } else if (mode === "firebase" && ref) {
+        ref.set(state).catch(function () { /* surfaced by caller UI if needed */ });
+      } else {
+        writeLocal(state);
+      }
+    }
+
+    // One poll tick (also exposed for tests): retry a pending save,
+    // then fetch the remote row. A newer updated_at whose normalized
+    // state differs replaces local state via the onRemote callbacks.
+    function pollOnce() {
+      if (!supa) { return Promise.resolve(false); }
+      if (pendingState && !saveTimer) { flushSupabaseSave(); }
+      return supa.fetchRemote().then(function (remote) {
+        setMode("supabase");
+        if (!remote || !remote.updatedAt) { return false; }
+        if (lastSeenUpdatedAt && remote.updatedAt <= lastSeenUpdatedAt) { return false; }
+        var incomingState = normalizeState(remote.state);
+        var incomingJson = JSON.stringify(incomingState);
+        lastSeenUpdatedAt = remote.updatedAt;
+        if (incomingJson === lastJson) { return false; }
+        lastJson = incomingJson;
+        currentState = incomingState;
+        writeLocal(incomingState);
+        remoteCbs.forEach(function (cb) { cb(incomingState); });
+        return true;
+      }).catch(function () {
+        setMode("supabase-offline");
+        return false;
+      });
+    }
+
+    function startPolling() {
+      if (pollTimer || typeof setInterval === "undefined") { return; }
+      pollTimer = setInterval(function () { pollOnce(); }, SUPABASE_POLL_MS);
+    }
+
+    function initSupabase(cfg) {
+      supa = createSupabaseClient(cfg);
+      var local = loadLocal();
+      return supa.fetchRemote().then(function (remote) {
+        mode = "supabase";
+        lastSeenUpdatedAt = remote.updatedAt || "";
+        var resolved = resolveInitialState(remote.state, local);
+        currentState = resolved.state;
+        lastJson = JSON.stringify(resolved.state);
+        writeLocal(resolved.state);
+        startPolling();
+        if (!resolved.shouldPush) { return resolved.state; }
+        // First-device seeding: remote is empty, this device has the
+        // data — push it up so every other device sees the same shop.
+        var iso = new Date().toISOString();
+        return supa.pushState(resolved.state, iso).then(function () {
+          lastSeenUpdatedAt = iso;
+          return resolved.state;
+        }).catch(function () {
+          setMode("supabase-offline");
+          pendingState = resolved.state;
+          return resolved.state;
+        });
+      }).catch(function () {
+        // Cloud unreachable on load: run fully from localStorage.
+        supa = null;
+        mode = "local";
+        return local;
+      });
+    }
+
     function init() {
+      var sc = supabaseConfig();
+      if (sc) { return initSupabase(sc); }
       if (configReady()) {
         try {
           var cfg = window.HAMZA_FIREBASE_CONFIG;
@@ -358,12 +589,14 @@
           return ref.once("value").then(function (snap) {
             var val = snap.val();
             var state = normalizeState(val);
+            currentState = state;
             lastJson = JSON.stringify(state);
             ref.on("value", function (s2) {
               var incoming = JSON.stringify(normalizeState(s2.val()));
               if (incoming !== lastJson) {
                 lastJson = incoming;
                 var st = JSON.parse(incoming);
+                currentState = st;
                 remoteCbs.forEach(function (cb) { cb(st); });
               }
             });
@@ -384,7 +617,8 @@
       init: init,
       save: persist,
       onRemote: function (cb) { remoteCbs.push(cb); },
-      getMode: function () { return mode; }
+      getMode: function () { return mode; },
+      pollOnce: pollOnce
     };
   }
 
@@ -404,6 +638,16 @@
     computeBillTotals: computeBillTotals,
     applyBillToStock: applyBillToStock,
     computeDashboard: computeDashboard,
-    createStore: createStore
+    createStore: createStore,
+    SUPABASE_POLL_MS: SUPABASE_POLL_MS,
+    SUPABASE_SAVE_DEBOUNCE_MS: SUPABASE_SAVE_DEBOUNCE_MS,
+    supabaseConfigReady: supabaseConfigReady,
+    supabaseSelectUrl: supabaseSelectUrl,
+    supabaseHeaders: supabaseHeaders,
+    supabaseUpsertRequest: supabaseUpsertRequest,
+    parseSupabaseRows: parseSupabaseRows,
+    stateHasData: stateHasData,
+    resolveInitialState: resolveInitialState,
+    createSupabaseClient: createSupabaseClient
   };
 });

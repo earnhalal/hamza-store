@@ -1,8 +1,9 @@
 /*
  * Hamza Departmental Store — Terminal UI
  * Plain static app. All state goes through HamzaData.normalizeState
- * and HamzaData.createStore (Firebase RTDB when configured, else
- * localStorage). Starts EMPTY — no sample shop data is seeded.
+ * and HamzaData.createStore (Supabase cloud when configured, else
+ * Firebase RTDB when configured, else localStorage). Starts EMPTY —
+ * no sample shop data is seeded.
  */
 (function () {
   "use strict";
@@ -114,7 +115,21 @@
     Array.prototype.forEach.call($("#tabs").querySelectorAll("button"), function (b) {
       b.addEventListener("click", function () { tab = b.getAttribute("data-tab"); render(); });
     });
-    $("#dataMode").textContent = "Data: " + (store.getMode() === "firebase" ? "Cloud (Firebase) — synced on all devices" : "This device only (local demo mode)");
+    $("#dataMode").textContent = "Data: " + dataModeLabel();
+  }
+  function dataModeLabel() {
+    var m = store.getMode();
+    if (m === "supabase") { return "Cloud (Supabase) — synced on all devices"; }
+    if (m === "supabase-offline") { return "Offline — saved on this device; sync will resume when the connection returns"; }
+    if (m === "firebase") { return "Cloud (Firebase) — synced on all devices"; }
+    return "This device only (cloud sync not connected)";
+  }
+  function dataModeDetail() {
+    var m = store.getMode();
+    if (m === "supabase") { return "Cloud (Supabase) — the same data opens on laptop and phone, and this device keeps an offline copy in the browser."; }
+    if (m === "supabase-offline") { return "Offline — the Supabase cloud cannot be reached right now. Data is saved on this device and sync retries automatically; nothing is lost."; }
+    if (m === "firebase") { return "Cloud (Firebase) — the same data opens on laptop and phone."; }
+    return "Local (this browser only) — cloud sync is not connected; see README.md.";
   }
 
   function render() {
@@ -851,7 +866,7 @@
       '<button class="btn secondary" id="stPinBtn">Change PIN</button>' +
       '<p class="small muted mt">The PIN is a simple shop gate. It is stored only as a basic hash in the synced data — do not reuse an important password as the shop PIN.</p></div>' +
       '<div class="panel"><h3>Data</h3>' +
-      '<p class="small">Current mode: <b>' + (store.getMode() === "firebase" ? "Cloud (Firebase) — the same data opens on laptop and phone" : "Local (this browser only) — add a Firebase config to sync across devices; see README.md") + '</b></p>' +
+      '<p class="small">Current mode: <b>' + dataModeDetail() + '</b></p>' +
       '<div class="row mt"><button class="btn secondary" id="stExport">Export Full Backup (JSON)</button>' +
       '<label class="btn secondary" style="cursor:pointer">Restore Backup (JSON)<input id="stImport" type="file" accept=".json,application/json" style="display:none"></label></div>' +
       '<div class="mt"><button class="btn danger" id="stClear">Clear All Shop Data</button></div></div>'
