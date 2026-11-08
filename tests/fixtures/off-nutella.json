@@ -1,0 +1,30 @@
+{
+ "code": "3017620422003",
+ "status": 1,
+ "product": {
+  "product_name": "Nutella",
+  "product_name_en": "Nutella",
+  "brands": "Nutella, Ferrero",
+  "quantity": "400 g e",
+  "categories_tags": [
+   "en:breakfasts",
+   "en:snacks",
+   "en:spreads",
+   "en:sweet-spreads",
+   "en:cocoa-and-its-products",
+   "en:cocoa-and-chocolate-powders",
+   "en:cocoa-powders",
+   "en:confectionary-based-spreads",
+   "en:Hazelnutx",
+   "en:Petit-d\u00e9jeuners",
+   "en:Produits \u00e0 tartiner",
+   "en:Produits \u00e0 tartiner sucr\u00e9s",
+   "en:P\u00e2tes \u00e0 tartiner",
+   "fr:Go\u00fbter",
+   "fr:Nutella",
+   "fr:Nuttela"
+  ],
+  "categories": "Snacks, Cocoa powders, Confectionary based spreads, Hazelnutx, Petit-d\u00e9jeuners, Produits \u00e0 tartiner, Produits \u00e0 tartiner sucr\u00e9s, P\u00e2tes \u00e0 tartiner, fr:Go\u00fbter, fr:Nutella, fr:Nuttela",
+  "generic_name": "Hazelnut And Cocoa Spread"
+ }
+}
